@@ -1,0 +1,28 @@
+# TwitchGuard application parameters (IR-27). Secrets never live here — see .env (IR-26).
+classifier:
+  batch_size: 10
+  batch_window_ms: 800
+  max_retries: 2
+  cli_timeout_s: 30
+  cache_ttl_s: 60
+  api_timeout_s: 30.0
+  retry_attempts: 3
+  backoff_base_s: 1.0
+  backoff_max_s: 60.0
+  latency_samples: 1000
+  cost_per_mtok_usd: 0.0
+
+ingest:
+  redis_stream_maxlen: 100000
+  dedup_ttl_s: 600
+  recent_messages: 50
+
+eventsub:
+  websocket_url: "wss://eventsub.wss.twitch.tv/ws"
+  reconnect_max_backoff_s: 30
+  keepalive_grace_s: 15
+
+security:
+  session_ttl_s: 604800
+  session_sliding_renewal: true
+  rate_limit_per_minute: 240
