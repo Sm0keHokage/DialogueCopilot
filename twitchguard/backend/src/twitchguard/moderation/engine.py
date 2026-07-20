@@ -34,6 +34,10 @@ GROUP = "classifier"
 CONSUMER = "worker-1"
 
 
+def consumer_name(n: int) -> str:
+    return f"worker-{n}"
+
+
 def cache_key(channel_id: int, text: str, rules_fp: str) -> str:
     digest = hashlib.sha256(text.strip().lower().encode("utf-8")).hexdigest()[:32]
     return f"tg:cls:{channel_id}:{rules_fp}:{digest}"
@@ -66,27 +70,60 @@ def _entry_to_message(entry_id: str, fields: dict[str, str]) -> ChatMessage:
     )
 
 
-async def _read_batch(app_state: Any, channel_id: int) -> list[ChatMessage]:
+async def _reclaim_stale(
+    app_state: Any, channel_id: int, consumer: str, count: int
+) -> list[ChatMessage]:
+    """Steal pending entries whose agent died or hung (multi-agent recovery)."""
+    redis: Redis = app_state.redis
+    cfg = app_state.config.classifier
+    try:
+        result: Any = await redis.xautoclaim(
+            stream_key(channel_id),
+            GROUP,
+            consumer,
+            min_idle_time=cfg.reclaim_idle_ms,
+            start_id="0-0",
+            count=count,
+        )
+    except Exception:  # noqa: BLE001 - reclaim is best-effort, never fatal
+        return []
+    entries = result[1] if isinstance(result, list | tuple) and len(result) >= 2 else []
+    return [_entry_to_message(eid, fields) for eid, fields in entries]
+
+
+async def _read_batch(app_state: Any, channel_id: int, consumer: str) -> list[ChatMessage]:
     redis: Redis = app_state.redis
     cfg = app_state.config.classifier
     key = stream_key(channel_id)
     await ensure_group(redis, key)
-    # Pending entries first (redelivery after crash/outage), then fresh ones.
+    # Own pending entries first (redelivery after crash/outage), then stale
+    # entries of dead sibling agents, then fresh ones. The consumer group
+    # shards fresh messages between agents automatically.
     batch: list[ChatMessage] = []
-    pending: Any = await redis.xreadgroup(GROUP, CONSUMER, {key: "0"}, count=cfg.batch_size)
+    seen: set[str] = set()
+
+    def _add(messages: list[ChatMessage]) -> None:
+        for msg in messages:
+            if msg.stream_id not in seen:
+                seen.add(msg.stream_id)
+                batch.append(msg)
+
+    pending: Any = await redis.xreadgroup(GROUP, consumer, {key: "0"}, count=cfg.batch_size)
     for _stream, entries in pending or []:
-        batch.extend(_entry_to_message(eid, fields) for eid, fields in entries)
+        _add([_entry_to_message(eid, fields) for eid, fields in entries])
+    if len(batch) < cfg.batch_size:
+        _add(await _reclaim_stale(app_state, channel_id, consumer, cfg.batch_size - len(batch)))
     if len(batch) < cfg.batch_size:
         block_ms = cfg.batch_window_ms if cfg.batch_window_ms > 0 else None
         fresh: Any = await redis.xreadgroup(
             GROUP,
-            CONSUMER,
+            consumer,
             {key: ">"},
             count=cfg.batch_size - len(batch),
             block=block_ms,
         )
         for _stream, entries in fresh or []:
-            batch.extend(_entry_to_message(eid, fields) for eid, fields in entries)
+            _add([_entry_to_message(eid, fields) for eid, fields in entries])
     return batch
 
 
@@ -151,8 +188,8 @@ async def _store_cache(
         )
 
 
-async def run_cycle(app_state: Any, channel_id: int) -> int:
-    """One classification cycle. Returns the number of messages processed."""
+async def run_cycle(app_state: Any, channel_id: int, consumer: str = CONSUMER) -> int:
+    """One classification cycle of one AI agent. Returns messages processed."""
     redis: Redis = app_state.redis
     cfg = app_state.config.classifier
     key = stream_key(channel_id)
@@ -161,7 +198,7 @@ async def run_cycle(app_state: Any, channel_id: int) -> int:
     if slowdown:
         await asyncio.sleep(min(float(slowdown), cfg.backoff_max_s))
 
-    batch = await _read_batch(app_state, channel_id)
+    batch = await _read_batch(app_state, channel_id, consumer)
     if not batch:
         return 0
 
@@ -258,11 +295,16 @@ async def run_cycle(app_state: Any, channel_id: int) -> int:
     return len(batch)
 
 
-async def classifier_loop(app_state: Any, channel_id: int) -> None:
-    """Long-running per-channel worker; the supervisor restarts it on crash."""
+async def classifier_loop(app_state: Any, channel_id: int, consumer: str = CONSUMER) -> None:
+    """One long-running AI agent; the supervisor restarts it on crash.
+
+    A channel may run several of these in parallel (channel.classifier_workers):
+    the Redis consumer group shards messages between them, so N agents give
+    ~N concurrent LLM calls for fast-moving chats.
+    """
     cfg = app_state.config.classifier
     while True:
-        processed = await run_cycle(app_state, channel_id)
+        processed = await run_cycle(app_state, channel_id, consumer)
         if processed == 0:
             await asyncio.sleep(cfg.idle_sleep_s)
 

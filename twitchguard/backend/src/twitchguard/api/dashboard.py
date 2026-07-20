@@ -14,6 +14,7 @@ from ..flags import rule_precision
 from ..ingest import recent_key
 from ..models import Channel, Usage
 from ..moderation.engine import backlog, latency_key
+from ..pipelines import classifier_task_prefix
 from ..rbac import AuthContext, require_channel_member
 from .deps import get_db
 
@@ -66,6 +67,9 @@ async def dashboard(
     total_tokens = int(totals[3])
 
     backend_cfg = dict(channel.backend_config or {})
+    active_workers = len(
+        app_state.supervisor.running_names(classifier_task_prefix(channel_id))
+    )
     return {
         "channel": {
             "id": channel.id,
@@ -74,6 +78,7 @@ async def dashboard(
             "needs_reauth": channel.needs_reauth,
             "action_proxy_enabled": channel.action_proxy_enabled,
         },
+        "workers": {"configured": channel.classifier_workers, "active": active_workers},
         "backend": {
             "type": backend_cfg.get("type"),
             "vendor": backend_cfg.get("vendor"),

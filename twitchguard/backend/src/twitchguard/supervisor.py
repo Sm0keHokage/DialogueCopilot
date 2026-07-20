@@ -39,6 +39,17 @@ class Supervisor:
         task = self._tasks.get(name)
         return task is not None and not task.done()
 
+    def running_names(self, prefix: str = "") -> list[str]:
+        return sorted(
+            name
+            for name, task in self._tasks.items()
+            if name.startswith(prefix) and not task.done()
+        )
+
+    async def stop_prefix(self, prefix: str) -> None:
+        for name in [n for n in list(self._tasks) if n.startswith(prefix)]:
+            await self.stop(name)
+
     async def stop(self, name: str) -> None:
         task = self._tasks.pop(name, None)
         if task is not None and not task.done():

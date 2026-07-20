@@ -13,7 +13,7 @@ from .audit import record
 from .db import as_utc, utcnow
 from .ingest import handle_chat_event
 from .models import Channel, User
-from .moderation.engine import classifier_loop
+from .moderation.engine import classifier_loop, consumer_name
 from .twitch.eventsub import EventSubListener
 from .twitch.oauth import TwitchAuthError
 
@@ -24,8 +24,18 @@ def eventsub_task_name(channel_id: int) -> str:
     return f"eventsub:{channel_id}"
 
 
-def classifier_task_name(channel_id: int) -> str:
-    return f"classifier:{channel_id}"
+def classifier_task_prefix(channel_id: int) -> str:
+    return f"classifier:{channel_id}:"
+
+
+def classifier_task_name(channel_id: int, worker: int) -> str:
+    return f"{classifier_task_prefix(channel_id)}{worker}"
+
+
+def effective_workers(app_state: Any, channel: Channel) -> int:
+    """Clamp the per-channel agent count to [1, classifier.max_workers]."""
+    configured = int(getattr(channel, "classifier_workers", 1) or 1)
+    return max(1, min(configured, app_state.config.classifier.max_workers))
 
 
 async def _channel_token(app_state: Any, channel_id: int) -> str:
@@ -82,12 +92,26 @@ async def eventsub_loop(app_state: Any, channel_id: int, twitch_user_id: str) ->
     await listener.run()
 
 
+def start_classifier_workers(app_state: Any, channel: Channel) -> int:
+    """Spawn the configured number of parallel AI agents for the channel."""
+    workers = effective_workers(app_state, channel)
+    for n in range(1, workers + 1):
+        app_state.supervisor.start(
+            classifier_task_name(channel.id, n),
+            functools.partial(classifier_loop, app_state, channel.id, consumer_name(n)),
+        )
+    return workers
+
+
+async def restart_classifier_workers(app_state: Any, channel: Channel) -> int:
+    """Hot-apply a new agent count without touching the EventSub listener."""
+    await app_state.supervisor.stop_prefix(classifier_task_prefix(channel.id))
+    return start_classifier_workers(app_state, channel)
+
+
 def start_channel_pipeline(app_state: Any, channel: Channel) -> None:
-    """FR-11/FR-14: listener + classifier per connected channel, supervised."""
-    app_state.supervisor.start(
-        classifier_task_name(channel.id),
-        functools.partial(classifier_loop, app_state, channel.id),
-    )
+    """FR-11/FR-14: listener + classifier agents per connected channel, supervised."""
+    start_classifier_workers(app_state, channel)
     app_state.supervisor.start(
         eventsub_task_name(channel.id),
         functools.partial(eventsub_loop, app_state, channel.id, channel.twitch_user_id),
@@ -96,7 +120,7 @@ def start_channel_pipeline(app_state: Any, channel: Channel) -> None:
 
 async def stop_channel_pipeline(app_state: Any, channel_id: int) -> None:
     await app_state.supervisor.stop(eventsub_task_name(channel_id))
-    await app_state.supervisor.stop(classifier_task_name(channel_id))
+    await app_state.supervisor.stop_prefix(classifier_task_prefix(channel_id))
 
 
 async def token_refresher_loop(app_state: Any) -> None:

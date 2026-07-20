@@ -11,6 +11,10 @@ classifier:
   backoff_max_s: 60.0
   latency_samples: 1000
   cost_per_mtok_usd: 0.0
+  # Максимум параллельных ИИ-агентов на канал (для чатов с большим онлайном).
+  max_workers: 8
+  # Сообщение, зависшее у агента дольше этого времени, перехватывает другой агент.
+  reclaim_idle_ms: 60000
 
 ingest:
   redis_stream_maxlen: 100000

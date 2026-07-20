@@ -21,6 +21,10 @@ class ClassifierConfig(BaseModel):
     latency_samples: int = 1000
     cost_per_mtok_usd: float = 0.0
     idle_sleep_s: float = 0.5
+    # Parallel AI agents per channel (upper bound for the per-channel setting).
+    max_workers: int = 8
+    # A pending message untouched this long is reclaimed by another agent.
+    reclaim_idle_ms: int = 60_000
 
 
 class IngestConfig(BaseModel):

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,7 @@ from ..errors import ApiError
 from ..models import Channel, User
 from ..moderation.backends import BackendContext, build_backend
 from ..moderation.backends.base import BackendUnavailable
+from ..pipelines import restart_classifier_workers
 from ..rbac import AuthContext, require_channel_owner
 from ..twitch.oauth import ACTION_SCOPES
 from .deps import get_db
@@ -31,6 +32,10 @@ class BackendBody(BaseModel):
 
 class ActionProxyBody(BaseModel):
     enabled: bool
+
+
+class WorkersBody(BaseModel):
+    workers: int = Field(ge=1)
 
 
 def _redacted_backend(config: dict[str, Any]) -> dict[str, Any]:
@@ -56,6 +61,7 @@ async def _get_channel(db: AsyncSession, channel_id: int) -> Channel:
 @router.get("")
 async def get_settings(
     channel_id: int,
+    request: Request,
     ctx: AuthContext = Depends(require_channel_owner),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -65,6 +71,8 @@ async def get_settings(
         "action_proxy_enabled": channel.action_proxy_enabled,
         "required_action_scopes": list(ACTION_SCOPES),
         "granted_scopes": list(channel.scopes or []),
+        "classifier_workers": channel.classifier_workers,
+        "max_workers": request.app.state.config.classifier.max_workers,
     }
 
 
@@ -121,6 +129,39 @@ async def put_backend(
     )
     await db.commit()
     return {"backend": _redacted_backend(candidate)}
+
+
+@router.put("/workers")
+async def put_workers(
+    channel_id: int,
+    body: WorkersBody,
+    request: Request,
+    ctx: AuthContext = Depends(require_channel_owner),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Parallel AI agents for fast chats. One Twitch reader account regardless
+    (AR-03) — only the classification stage fans out; the Redis consumer group
+    shards messages between agents. Applied hot, without a restart."""
+    app_state = request.app.state
+    max_workers = app_state.config.classifier.max_workers
+    if body.workers > max_workers:
+        raise ApiError(
+            422,
+            "too_many_workers",
+            f"At most {max_workers} parallel agents are allowed (classifier.max_workers)",
+            field="workers",
+        )
+    channel = await _get_channel(db, channel_id)
+    channel.classifier_workers = body.workers
+    await record(
+        db, channel_id=channel_id, actor_type="user", actor_id=ctx.user_id,
+        action="settings.workers_changed", payload={"workers": body.workers},
+    )
+    await db.commit()
+    active = 0
+    if app_state.settings.start_workers and channel.encrypted_access_token:
+        active = await restart_classifier_workers(app_state, channel)
+    return {"workers": body.workers, "max_workers": max_workers, "active": active}
 
 
 @router.put("/action-proxy")

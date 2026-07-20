@@ -49,6 +49,9 @@ class Channel(Base):
     action_proxy_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # FR-08: set when the refresh token is invalid -> "reconnect required".
     needs_reauth: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Parallel AI classifier agents for high-traffic chats (one Twitch reader
+    # account regardless — AR-03; only classification fans out).
+    classifier_workers: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         TZDateTime, nullable=False, default=utcnow, onupdate=utcnow
