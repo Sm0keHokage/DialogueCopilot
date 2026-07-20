@@ -17,6 +17,22 @@
                               или локальный CLI: claude | gemini | codex
 ```
 
+## Как передаются звук и картинка трансляции
+
+**Никак — и это принципиально.** В системе нет Playwright, Selenium и любой другой браузерной
+автоматизации или парсеров:
+
+- **Чат** приходит официальным **Twitch EventSub WebSocket** (`channel.chat.message`) — это текстовые
+  JSON-события от самого Twitch, задокументированный API, а не скрейпинг страницы.
+- **Видео и звук** TwitchGuard не проксирует и не перекодирует вообще. В дашборд встроен
+  **официальный Twitch-плеер** (iframe `player.twitch.tv`): медиапоток идёт напрямую с CDN Twitch в
+  браузер модератора. Наш backend не касается ни одного байта аудио/видео — он работает только с
+  текстом чата.
+- **Действия модерации** — официальный **Helix API** под токеном живого модератора.
+
+Это одновременно и легально (соответствует Twitch Developer Services Agreement — парсинг и обход
+плеера запрещены), и дешевле/надёжнее: не нужны headless-браузеры и ре-стриминговая инфраструктура.
+
 ## Возможности
 
 - **Подключение канала только через Twitch OAuth** (Authorization Code Flow + `state`); форм пароля/2FA
@@ -36,8 +52,20 @@
   токеном** (не ботом), со scope-проверкой, идемпотентностью и аудитом (FR-40..FR-43, FR-54..FR-56).
 - **Наблюдаемость**: дашборд со статусами, счётчиками, p50/p95 задержки, отставанием очереди,
   precision по правилам (датасет ложных срабатываний) и стоимостью (FR-36, FR-49).
-- **Безопасность**: токены и API-ключи шифруются at-rest (Fernet, ключ из env), секреты редактируются
-  в логах, RBAC на каждом эндпоинте, rate-limit, httpOnly/secure/SameSite cookie (NFR-Sec-01..06).
+- **Параллельные ИИ-агенты** для чатов с большим онлайном: владелец задаёт число агентов на канал
+  (Настройки → «Параллельные ИИ-агенты», до `classifier.max_workers`); Redis consumer group шардирует
+  поток между агентами, каждый делает свои LLM-вызовы конкурентно, зависшие у упавшего агента
+  сообщения перехватываются соседним (`XAUTOCLAIM`). Twitch-аккаунт при этом остаётся **один** —
+  несколько аккаунтов на канал запрещены правилами Twitch и SRS (AR-03); масштабируется только
+  классификация, которая и является узким местом.
+- **Личный кабинет**: регистрация почта+ник+пароль с подтверждением по email, вход по почте или нику,
+  привязка Twitch-канала через OAuth из кабинета, смена пароля, «выйти на всех устройствах», тариф
+  «Бесплатно · бета» со всеми фишками.
+- **Безопасность**: токены и API-ключи шифруются at-rest (Fernet, ключ из env), пароли — scrypt с
+  солью, ссылки подтверждения одноразовые с TTL и хранятся хэшем, анти-брутфорс (лок на 15 минут после
+  5 неудачных попыток), защита от перечисления почт, регенерация сессии при входе, инвалидация чужих
+  сессий при смене пароля, секреты редактируются в логах, RBAC на каждом эндпоинте, rate-limit,
+  httpOnly/secure/SameSite cookie, security-заголовки и CSP (NFR-Sec-01..06).
 
 ## Быстрый старт (docker-compose)
 
@@ -94,7 +122,8 @@ cd frontend && npm install && npm run dev
 
 ```bash
 cd backend
-.venv/bin/pytest -q          # 51 тест: OAuth+state, RBAC, автомат флагов, классификатор,
+.venv/bin/pytest -q          # 71 тест: OAuth+state, личный кабинет (регистрация/подтверждение/
+                             # брутфорс-лок), RBAC, автомат флагов, классификатор и пул ИИ-агентов,
                              # кэш/дедуп/ретраи, Action Proxy, WS, security log-grep
 .venv/bin/ruff check src tests
 .venv/bin/mypy src
@@ -107,7 +136,9 @@ cd ../frontend && npm run lint && npm run build
 
 - **Секреты — только окружение** (IR-26): `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`,
   `TWITCH_REDIRECT_URI`, `ENCRYPTION_KEY`, `DATABASE_URL`, `REDIS_URL`, `SESSION_SECRET`
-  (+ деплойные `FRONTEND_ORIGIN`, `SESSION_COOKIE_SECURE`, `CONFIG_FILE`).
+  (+ деплойные `FRONTEND_ORIGIN`, `SESSION_COOKIE_SECURE`, `CONFIG_FILE`; почта кабинета —
+  `SMTP_HOST/PORT/USER/PASSWORD/FROM/STARTTLS`, `PUBLIC_BASE_URL`; без SMTP_HOST ссылка
+  подтверждения пишется в лог — удобно для разработки).
 - **Прикладные параметры** (IR-27) — `backend/config.example.yaml` (валидируется pydantic-settings):
   размер/окно батча, `max_retries`, `cli_timeout_s`, TTL кэша, `redis_stream_maxlen`,
   `reconnect_max_backoff_s`, TTL сессий, rate-limit, `cost_per_mtok_usd` для оценки стоимости.
@@ -118,12 +149,14 @@ cd ../frontend && npm run lint && npm run build
 twitchguard/
 ├── backend/
 │   ├── src/twitchguard/
-│   │   ├── api/               # роутеры §9: auth, rules, flags, settings, moderators, dashboard, WS
+│   │   ├── api/               # роутеры §9: auth, account, rules, flags, settings, moderators, dashboard, WS
 │   │   ├── twitch/            # ВЕСЬ Twitch-специфичный код: oauth, helix, eventsub (NFR-Main-01)
-│   │   ├── moderation/        # промпт, вердикты, engine, backends/ (anthropic|openai|deepseek|cli)
+│   │   ├── moderation/        # промпт, вердикты, engine (пул ИИ-агентов), backends/
 │   │   ├── rules/             # парсер frontmatter, версии, встроенные правила
 │   │   ├── flags.py           # конечный автомат §8, precision
 │   │   ├── actions.py         # Action Proxy §10
+│   │   ├── accounts.py        # личный кабинет: scrypt-пароли, токены подтверждения
+│   │   ├── emailer.py         # отправка писем (SMTP или dev-режим в лог)
 │   │   ├── ingest.py ws.py pipelines.py supervisor.py crypto.py rbac.py sessions.py …
 │   ├── rules_builtin/         # встроенные spam.md, toxicity.md
 │   ├── migrations/            # Alembic (схема §7)
@@ -135,9 +168,12 @@ twitchguard/
 
 ## Как это соответствует правилам Twitch (NFR-Main-03/04)
 
-- **Никаких паролей и 2FA.** Единственный путь авторизации — официальный OAuth Authorization Code
-  Flow; учётные данные вводятся только на страницах Twitch. В коде нет ни одного эндпоинта или поля,
-  принимающего пароль (проверяется тестом по OpenAPI-схеме).
+- **Никаких паролей и 2FA от Twitch.** Подключение канала — только официальный OAuth Authorization
+  Code Flow; учётные данные Twitch вводятся только на страницах Twitch. Пароль личного кабинета
+  TwitchGuard — отдельная локальная сущность (эндпоинты `/account/*`), к Twitch-аккаунту отношения не
+  имеет; тест по OpenAPI-схеме гарантирует, что вне `/account/*` полей с паролем нет. Это осознанное
+  расширение исходного AR-01 по решению владельца продукта: смысл требования — «не собирать учётные
+  данные Twitch» — сохранён.
 - **Система никогда не пишет в чат.** В Helix-клиенте отсутствует метод отправки сообщений; никакой
   имитации зрителей, накрутки и «реплик от бота» (AR-02, AR-03). Читающая учётная запись одна.
 - **Никаких автоматических наказаний.** Базовый режим — advisory: ИИ только помечает. Опция Action

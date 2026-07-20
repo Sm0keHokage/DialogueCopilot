@@ -86,3 +86,16 @@ class Settings(BaseSettings):
     db_create_all: bool = False
     start_workers: bool = True
     log_level: str = "INFO"
+
+    # Local account system (личный кабинет) email delivery — stdlib smtplib
+    # only (emailer.py). Empty smtp_host means "no SMTP configured": mail is
+    # recorded in Emailer.outbox but never actually sent (local dev/tests).
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "TwitchGuard <no-reply@twitchguard.local>"
+    smtp_starttls: bool = True
+    # Base URL used to build links in outgoing mail (e.g. .../verify?token=..);
+    # falls back to frontend_origin when unset.
+    public_base_url: str = ""

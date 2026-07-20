@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..audit import record
 from ..db import utcnow
 from ..errors import ApiError
-from ..models import Channel, ModeratorInvite, User
+from ..models import Account, Channel, ModeratorInvite, User
 from ..pipelines import start_channel_pipeline, stop_channel_pipeline
 from ..rbac import (
     ROLE_MODERATOR,
@@ -26,25 +26,13 @@ from ..rbac import (
     AuthContext,
     load_session,
     require_channel_owner,
+    set_session_cookie,
 )
 from ..rules.service import seed_builtin_rules
 from ..twitch.oauth import ACTION_SCOPES, READ_SCOPES, TwitchAuthError
 from .deps import get_db
 
 router = APIRouter()
-
-
-def _set_session_cookie(request: Request, response: Response, value: str) -> None:
-    settings = request.app.state.settings
-    response.set_cookie(
-        settings.session_cookie_name,
-        value,
-        max_age=request.app.state.config.security.session_ttl_s,
-        httponly=True,
-        secure=settings.session_cookie_secure,
-        samesite="lax",
-        path="/",
-    )
 
 
 @router.get("/auth/twitch/login")
@@ -64,7 +52,7 @@ async def twitch_login(request: Request, action_scopes: int = 0) -> Response:
         request.app.state.oauth.authorize_url(state, scopes), status_code=302
     )
     if cookie_value:
-        _set_session_cookie(request, response, cookie_value)
+        set_session_cookie(request, response, cookie_value)
     return response
 
 
@@ -87,6 +75,20 @@ async def twitch_callback(
         raise ApiError(400, "state_mismatch", "OAuth state mismatch")
     if not code:
         raise ApiError(400, "missing_code", "Missing authorization code")
+
+    # Local account (личный кабинет) linking the Twitch account: the account
+    # must be email-verified before it may connect Twitch. Checked before the
+    # code exchange — simplest correct point, and it does not burn the
+    # one-time authorization code on a request that must fail anyway.
+    account_id_raw = session.data.get("account_id") if session else None
+    if account_id_raw is not None:
+        linked_account = (
+            await db.execute(select(Account).where(Account.id == int(account_id_raw)))
+        ).scalar_one_or_none()
+        if linked_account is None or not linked_account.email_verified:
+            raise ApiError(
+                403, "email_not_verified", "Verify your account email before linking Twitch"
+            )
 
     app_state = request.app.state
     try:
@@ -158,6 +160,8 @@ async def twitch_callback(
     user.encrypted_refresh_token = enc.encrypt(tokens.refresh_token or "")
     user.token_expires_at = expires_at
     user.scopes = list(scopes)
+    if account_id_raw is not None:
+        user.account_id = int(account_id_raw)
     await db.flush()
     await db.commit()
 
@@ -169,6 +173,12 @@ async def twitch_callback(
         "twitch_user_id": identity.user_id,
         "login": identity.login,
     }
+    if account_id_raw is not None:
+        # Merge the local-account link into the (now Twitch-authenticated)
+        # session so /auth/me and channel endpoints both work immediately.
+        data["account_id"] = int(account_id_raw)
+        if session is not None and "nick" in session.data:
+            data["nick"] = session.data["nick"]
     if session is not None:
         await store.save(session.sid, data)
         cookie_value = None
@@ -182,39 +192,73 @@ async def twitch_callback(
         f"{app_state.settings.frontend_origin}/dashboard", status_code=302
     )
     if cookie_value:
-        _set_session_cookie(request, response, cookie_value)
+        set_session_cookie(request, response, cookie_value)
     return response
 
 
 @router.get("/auth/me")
 async def me(request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Authenticated means the session carries a Twitch identity (user_id), a
+    local-account identity (account_id — личный кабинет), or both. `user` and
+    `channel` stay exactly as before for Twitch-linked sessions; `account`
+    and `twitch_linked` are the new, additive fields."""
     session = await load_session(request)
-    if session is None or "user_id" not in session.data:
+    d = session.data if session is not None else {}
+    has_user = "user_id" in d
+    has_account = "account_id" in d
+    if not has_user and not has_account:
         return {"authenticated": False}
-    d = session.data
-    channel = (
-        await db.execute(select(Channel).where(Channel.id == int(d["channel_id"])))
-    ).scalar_one_or_none()
-    user = (
-        await db.execute(select(User).where(User.id == int(d["user_id"])))
-    ).scalar_one_or_none()
-    can_action = bool(
-        channel is not None
-        and channel.action_proxy_enabled
-        and user is not None
-        and user.encrypted_access_token
-        and any(s in (user.scopes or []) for s in ACTION_SCOPES)
-    )
-    return {
-        "authenticated": True,
-        "user": {"id": d["user_id"], "login": d.get("login"), "role": d.get("role")},
-        "channel": {
+
+    user: User | None = None
+    user_out: dict[str, Any] | None = None
+    channel_out: dict[str, Any] | None = None
+    can_action = False
+    if has_user:
+        channel = (
+            await db.execute(select(Channel).where(Channel.id == int(d["channel_id"])))
+        ).scalar_one_or_none()
+        user = (
+            await db.execute(select(User).where(User.id == int(d["user_id"])))
+        ).scalar_one_or_none()
+        can_action = bool(
+            channel is not None
+            and channel.action_proxy_enabled
+            and user is not None
+            and user.encrypted_access_token
+            and any(s in (user.scopes or []) for s in ACTION_SCOPES)
+        )
+        user_out = {"id": d["user_id"], "login": d.get("login"), "role": d.get("role")}
+        channel_out = {
             "id": d["channel_id"],
             "display_name": channel.display_name if channel else None,
             "eventsub_status": channel.eventsub_status if channel else "inactive",
             "needs_reauth": channel.needs_reauth if channel else False,
-        },
+        }
+
+    account_id: int | None = None
+    if has_account:
+        account_id = int(d["account_id"])
+    elif user is not None and user.account_id is not None:
+        account_id = user.account_id
+    account_out: dict[str, Any] | None = None
+    if account_id is not None:
+        account = (
+            await db.execute(select(Account).where(Account.id == account_id))
+        ).scalar_one_or_none()
+        if account is not None:
+            account_out = {
+                "email": account.email,
+                "nick": account.nick,
+                "email_verified": account.email_verified,
+            }
+
+    return {
+        "authenticated": True,
+        "user": user_out,
+        "channel": channel_out,
         "can_action": can_action,
+        "account": account_out,
+        "twitch_linked": has_user,
     }
 
 

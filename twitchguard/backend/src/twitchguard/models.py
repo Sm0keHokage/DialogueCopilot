@@ -58,6 +58,29 @@ class Channel(Base):
     )
 
 
+class Account(Base):
+    """Local account system (личный кабинет): email+nick+password, kept fully
+    separate from Twitch identity (NFR-Sec-01/AR-01 — this table never stores
+    a Twitch credential, only the scrypt hash of a locally-chosen password,
+    see accounts.py). A `User` row (Twitch identity) may optionally link to
+    one `Account` via `User.account_id` once its owner verifies their email
+    and connects Twitch (see api/auth.py callback)."""
+
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)  # stored lowercase
+    nick: Mapped[str] = mapped_column(Text, nullable=False, unique=True)  # stored lowercase
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verify_token_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verify_expires_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        TZDateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+
 class User(Base):
     """DR-08 plus encrypted per-user tokens needed by Action Proxy (FR-41/FR-54)."""
 
@@ -71,6 +94,13 @@ class User(Base):
         BigInteger().with_variant(Integer(), "sqlite"),
         ForeignKey("channels.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    # Optional link to a local account (личный кабинет) — set once its owner
+    # verifies their email and connects Twitch (api/auth.py callback).
+    account_id: Mapped[int | None] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"),
+        ForeignKey("accounts.id"),
+        nullable=True,
     )
     encrypted_access_token: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     encrypted_refresh_token: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)

@@ -89,6 +89,9 @@ export default function Dashboard() {
           ) : (
             <p className="warn-text">не настроен — классификация не идёт</p>
           )}
+          <p className="muted small">
+            ИИ-агентов: {data.workers.configured} (активно {data.workers.active})
+          </p>
         </div>
         <div className="card">
           <h3>Сегодня</h3>
@@ -110,6 +113,23 @@ export default function Dashboard() {
           <p className="muted small">отставание очереди: {data.backlog} сообщ.</p>
         </div>
       </div>
+
+      {data.channel.display_name && (
+        <section className="panel">
+          <h3>Трансляция</h3>
+          <div className="player-16x9">
+            <iframe
+              src={`https://player.twitch.tv/?channel=${data.channel.display_name}&parent=${window.location.hostname}&muted=true`}
+              allowFullScreen
+              title="Трансляция Twitch"
+            />
+          </div>
+          <p className="muted small">
+            Официальный плеер Twitch — звук и видео идут напрямую с Twitch, TwitchGuard медиа не
+            обрабатывает.
+          </p>
+        </section>
+      )}
 
       <div className="columns">
         <section className="panel">

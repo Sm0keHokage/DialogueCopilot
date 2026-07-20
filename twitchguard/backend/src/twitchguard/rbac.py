@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fastapi import Request
+from fastapi import Request, Response
 
 from .errors import ApiError
 from .sessions import SessionData
@@ -22,10 +22,32 @@ class AuthContext:
     session: SessionData
 
 
+@dataclass
+class AccountContext:
+    """Local-account session (личный кабинет) — see api/account.py."""
+
+    account_id: int
+    session: SessionData
+
+
 async def load_session(request: Request) -> SessionData | None:
     store = request.app.state.sessions
     cookie = request.cookies.get(request.app.state.settings.session_cookie_name)
     return await store.load(cookie)
+
+
+def set_session_cookie(request: Request, response: Response, value: str) -> None:
+    """Write the signed session-id cookie; mirrors load_session's read side."""
+    settings = request.app.state.settings
+    response.set_cookie(
+        settings.session_cookie_name,
+        value,
+        max_age=request.app.state.config.security.session_ttl_s,
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
 
 
 async def require_auth(request: Request) -> AuthContext:
@@ -41,6 +63,14 @@ async def require_auth(request: Request) -> AuthContext:
         login=str(d.get("login", "")),
         session=sess,
     )
+
+
+async def require_account(request: Request) -> AccountContext:
+    """Require a local-account session (independent of any Twitch link)."""
+    sess = await load_session(request)
+    if sess is None or "account_id" not in sess.data:
+        raise ApiError(401, "unauthorized", "Account authentication required")
+    return AccountContext(account_id=int(sess.data["account_id"]), session=sess)
 
 
 async def require_channel_member(channel_id: int, request: Request) -> AuthContext:

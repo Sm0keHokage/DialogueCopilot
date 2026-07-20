@@ -1,22 +1,23 @@
 """Application factory: state wiring, middleware, routers, worker lifecycle."""
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 import redis.asyncio as redis_asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .api import auth, dashboard, flags, moderators, rules, stream
+from .api import account, auth, dashboard, flags, moderators, rules, stream
 from .api import settings as settings_api
 from .config import AppConfig, Settings, load_app_config
 from .crypto import TokenCipher
 from .db import create_db_engine, create_sessionmaker, init_models
+from .emailer import Emailer
 from .errors import install_error_handlers
 from .logging_setup import register_secret, setup_logging
 from .models import Channel
@@ -44,6 +45,7 @@ def create_app(
     register_secret(settings.twitch_client_secret)
     register_secret(settings.encryption_key)
     register_secret(settings.session_secret)
+    register_secret(settings.smtp_password)
 
     app = FastAPI(title="TwitchGuard", version="0.1.0", lifespan=_lifespan)
     state = app.state
@@ -72,6 +74,7 @@ def create_app(
         settings.twitch_redirect_uri,
     )
     state.helix = HelixClient(state.http, settings.helix_base_url, settings.twitch_client_id)
+    state.emailer = Emailer(settings)
 
     app.add_middleware(
         CORSMiddleware,
@@ -83,6 +86,22 @@ def create_app(
     install_rate_limit(app)
     install_error_handlers(app)
 
+    @app.middleware("http")
+    async def _security_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        """Baseline hardening headers on every response; /account and /auth
+        additionally opt out of caching since they carry session-sensitive
+        payloads (nonce codes, account details, tokens)."""
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path.startswith(("/account", "/auth")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    app.include_router(account.router)
     app.include_router(auth.router)
     app.include_router(rules.router)
     app.include_router(flags.router)

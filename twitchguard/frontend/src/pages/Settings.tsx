@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from '../api'
 import { useMe } from '../App'
-import type { ChannelSettings, Moderators } from '../types'
+import type { ChannelSettings, Moderators, WorkersSettings } from '../types'
 
 const API_VENDORS = ['anthropic', 'openai', 'deepseek'] as const
 // AC-12: список CLI-инструментов не содержит DeepSeek — у вендора нет CLI-агента.
@@ -117,6 +117,72 @@ function BackendForm({
       <button className="btn primary" disabled={busy} onClick={() => void save()}>
         Проверить и сохранить
       </button>
+      {message && <p className={message.ok ? 'ok-text' : 'error'}>{message.text}</p>}
+    </section>
+  )
+}
+
+function WorkersPanel({
+  channelId,
+  settings,
+  onSaved,
+}: {
+  channelId: number
+  settings: ChannelSettings
+  onSaved: () => void
+}) {
+  const [workers, setWorkers] = useState(settings.classifier_workers)
+  const [active, setActive] = useState<number | null>(null)
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const save = async () => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const resp = await api.put<WorkersSettings>(`/channels/${channelId}/settings/workers`, {
+        workers,
+      })
+      setWorkers(resp.workers)
+      setActive(resp.active)
+      setMessage({ ok: true, text: `Сохранено. Сейчас активно агентов: ${resp.active}.` })
+      onSaved()
+    } catch (e) {
+      setMessage({ ok: false, text: e instanceof ApiError ? e.message : 'Не удалось сохранить' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="panel">
+      <h3>Параллельные ИИ-агенты</h3>
+      <p className="muted small">
+        Для стримов с большим онлайном: несколько агентов разбирают чат параллельно. Аккаунт
+        Twitch при этом один — масштабируется только классификация.
+      </p>
+      <div className="row">
+        <input
+          type="range"
+          min={1}
+          max={settings.max_workers}
+          value={workers}
+          onChange={(e) => setWorkers(Number(e.target.value))}
+        />
+        <input
+          className="num-sm"
+          type="number"
+          min={1}
+          max={settings.max_workers}
+          value={workers}
+          onChange={(e) => setWorkers(Number(e.target.value))}
+        />
+        <span className="muted small">из {settings.max_workers}</span>
+      </div>
+      <button className="btn primary" disabled={busy} onClick={() => void save()}>
+        Сохранить
+      </button>
+      {active !== null && <p className="muted small">Активно агентов сейчас: {active}</p>}
       {message && <p className={message.ok ? 'ok-text' : 'error'}>{message.text}</p>}
     </section>
   )
@@ -242,7 +308,7 @@ export default function Settings() {
   const disconnect = async () => {
     if (!window.confirm('Отключить канал? Токены будут отозваны, слушатель остановлен.')) return
     await api.post(`/channels/${channelId}/disconnect`)
-    window.location.href = '/login'
+    window.location.href = '/'
   }
 
   if (!settings) return <p className="muted">Загрузка…</p>
@@ -250,6 +316,7 @@ export default function Settings() {
     <div>
       <h2>Настройки</h2>
       <BackendForm channelId={channelId} settings={settings} onSaved={() => void load()} />
+      <WorkersPanel channelId={channelId} settings={settings} onSaved={() => void load()} />
       <ActionProxy channelId={channelId} settings={settings} onSaved={() => void load()} />
       <ModeratorsPanel channelId={channelId} />
       <section className="panel danger-zone">

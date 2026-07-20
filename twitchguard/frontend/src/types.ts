@@ -1,13 +1,21 @@
+export interface Account {
+  email: string
+  nick: string
+  email_verified: boolean
+}
+
 export interface Me {
   authenticated: boolean
-  user?: { id: number; login: string; role: 'owner' | 'moderator' }
-  channel?: {
+  account: Account | null
+  twitch_linked: boolean
+  user: { id: number; login: string; role: 'owner' | 'moderator' } | null
+  channel: {
     id: number
     display_name: string | null
     eventsub_status: string
     needs_reauth: boolean
-  }
-  can_action?: boolean
+  } | null
+  can_action: boolean
 }
 
 export interface Flag {
@@ -59,6 +67,14 @@ export interface ChannelSettings {
   action_proxy_enabled: boolean
   required_action_scopes: string[]
   granted_scopes: string[]
+  classifier_workers: number
+  max_workers: number
+}
+
+export interface WorkersSettings {
+  workers: number
+  max_workers: number
+  active: number
 }
 
 export interface Dashboard {
@@ -70,6 +86,7 @@ export interface Dashboard {
     action_proxy_enabled: boolean
   }
   backend: { type: string | null; vendor: string | null; cli_tool: string | null; configured: boolean }
+  workers: { configured: number; active: number }
   today: Counters
   total: Counters & { cost_usd: number }
   latency_ms: { p50: number | null; p95: number | null; samples: number }
